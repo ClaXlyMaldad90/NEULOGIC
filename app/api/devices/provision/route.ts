@@ -3,11 +3,12 @@ import { createClient } from "@supabase/supabase-js"
 import { NextResponse } from "next/server"
 import crypto from "crypto"
 
-// Service role client for creating devices (bypasses RLS)
-const supabaseAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-)
+function getSupabaseAdmin() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  )
+}
 
 /**
  * POST /api/devices/provision
@@ -15,6 +16,7 @@ const supabaseAdmin = createClient(
  * Called from the device setup page after WiFi config is sent via Web Serial.
  */
 export async function POST(request: Request) {
+  const supabaseAdmin = getSupabaseAdmin()
   const supabase = await createServerClient()
   const {
     data: { user },

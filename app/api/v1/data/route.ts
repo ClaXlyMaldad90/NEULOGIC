@@ -9,13 +9,16 @@ import {
   detectAlerts,
 } from "@/lib/sensor-processing"
 
-// Use service role for sensor data ingestion (ESP8266 sends data via auth_token, not user session)
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-)
+// Lazily create the service role client to avoid build-time env var errors
+function getSupabaseAdmin() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  )
+}
 
 export async function POST(request: Request) {
+  const supabase = getSupabaseAdmin()
   const receivedAt = Date.now()
 
   try {
