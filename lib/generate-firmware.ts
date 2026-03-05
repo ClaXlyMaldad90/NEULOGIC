@@ -1,4 +1,4 @@
-**
+/**
  * Generates a pre-configured .ino firmware file for ESP8266.
  * Minimal test firmware: connect WiFi, send JSON to server, show phases in Serial.
  * Uses HTTPS (WiFiClientSecure) for Vercel deployment.
