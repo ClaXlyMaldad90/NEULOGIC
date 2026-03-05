@@ -9,11 +9,13 @@ import {
   detectAlerts,
 } from "@/lib/sensor-processing"
 
-// Service role to bypass RLS
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-)
+// Lazily create the service role client to avoid build-time env var errors
+function getSupabaseAdmin() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!
+  )
+}
 
 /**
  * POST /api/simulate
@@ -21,6 +23,7 @@ const supabase = createClient(
  * Requires user to be authenticated and own the device.
  */
 export async function POST(request: Request) {
+  const supabase = getSupabaseAdmin()
   const sentAt = Date.now()
 
   try {
