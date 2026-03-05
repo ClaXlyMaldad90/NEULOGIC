@@ -24,31 +24,31 @@ export async function POST(request: Request) {
   try {
     const body = await request.json()
 
-    const { auth_token, gsr, sound, accel_x, accel_y, accel_z, sent_at } = body
+    const { device_code, gsr, sound, accel_x, accel_y, accel_z, sent_at } = body
 
-    // Validate required fields - ESP8266 authenticates with its unique auth_token
-    if (!auth_token || gsr === undefined || sound === undefined) {
+    // Validate required fields — ESP8266 identifies itself with device_code
+    if (!device_code || gsr === undefined || sound === undefined) {
       return NextResponse.json(
-        { error: "Campos requeridos: auth_token, gsr, sound" },
+        { error: "Campos requeridos: device_code, gsr, sound" },
         { status: 400 }
       )
     }
 
-    // Verify device exists via auth_token (unique per ESP8266)
+    // Find device by device_code (unique per ESP8266)
     const { data: device, error: deviceError } = await supabase
       .from("devices")
       .select("id, device_code, device_name")
-      .eq("auth_token", auth_token)
+      .eq("device_code", device_code)
       .single()
 
     if (deviceError || !device) {
       return NextResponse.json(
-        { error: "Token de autenticacion invalido. Dispositivo no encontrado." },
-        { status: 401 }
+        { error: "Dispositivo no encontrado. Verifica el device_code." },
+        { status: 404 }
       )
     }
 
-    // Calculate latency if sent_at is provided (milliseconds since epoch from ESP8266)
+    // Calculate latency if sent_at is provided (milliseconds since boot from ESP8266)
     const latencyMs = sent_at ? Math.max(0, receivedAt - sent_at) : null
 
     // Normalize sensor values
@@ -109,7 +109,7 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json({
-      stored: true,
+      ok: true,
       stress_index: filteredStress,
       alerts: alerts.length,
       timestamp,
@@ -127,10 +127,10 @@ export async function POST(request: Request) {
 export async function GET() {
   return NextResponse.json({
     status: "NeuroSense API v1 - ESP8266 Sensor Data Endpoint",
-    version: "2.0",
-    auth: "token-based (auth_token)",
+    version: "3.0",
+    auth: "device_code (no token required)",
     fields: {
-      required: ["auth_token", "gsr", "sound"],
+      required: ["device_code", "gsr", "sound"],
       optional: ["accel_x", "accel_y", "accel_z", "sent_at"],
     },
   })

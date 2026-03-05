@@ -1,388 +1,252 @@
 /**
- * Generates a pre-configured .ino firmware file for ESP8266 with
- * WiFi credentials, server URL, and auth token hardcoded.
- * The WiFi password never leaves the browser - it's embedded directly
- * into the .ino file that the user downloads.
+ * Generates a pre-configured .ino firmware file for ESP8266.
+ * Minimal test firmware: connect WiFi, send JSON to server, show phases in Serial.
+ * Uses HTTPS (WiFiClientSecure) for Vercel deployment.
+ * WiFi password stays in the browser -- never sent to the server.
  */
 export function generateFirmwareINO({
   wifiSsid,
   wifiPassword,
-  serverUrl,
-  authToken,
+  serverHost,
   deviceName,
   deviceCode,
 }: {
   wifiSsid: string
   wifiPassword: string
-  serverUrl: string
-  authToken: string
+  serverHost: string
   deviceName: string
   deviceCode: string
 }): string {
-  // Escape special characters for C strings
-  const escapeC = (s: string) =>
+  const esc = (s: string) =>
     s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")
 
   return `/*
- * ============================================================================
- * NEUROSENSE ESP8266 FIRMWARE v2.0.0 — PRE-CONFIGURADO
- * ============================================================================
+ * ============================================================
+ *  NEUROSENSE ESP8266  --  Firmware de verificacion v3.0
+ * ============================================================
+ *  Dispositivo : ${esc(deviceName)} (${esc(deviceCode)})
+ *  Red WiFi    : ${esc(wifiSsid)}
+ *  Servidor    : ${esc(serverHost)}
  *
- * Dispositivo: ${escapeC(deviceName)} (${escapeC(deviceCode)})
- * Red WiFi:    ${escapeC(wifiSsid)}
- * Servidor:    ${escapeC(serverUrl)}
- *
- * INSTRUCCIONES:
+ *  INSTRUCCIONES:
  *   1. Abre este archivo en Arduino IDE.
- *   2. Instala el board "ESP8266" desde Boards Manager.
- *   3. Instala las librerias: ArduinoJson (v7.x).
- *   4. Selecciona tu placa (NodeMCU 1.0 o Wemos D1 Mini).
- *   5. Conecta el ESP8266 por USB y haz clic en "Subir".
- *   6. Abre el Monitor Serial (115200 baud) para ver los logs.
- *
- * Librerias requeridas (Arduino IDE > Herramientas > Administrar Bibliotecas):
- *   - ArduinoJson  (by Benoit Blanchon, v7.x)
- *   - ESP8266WiFi   (incluida con el board package)
- *   - ESP8266HTTPClient (incluida con el board package)
- *
- * Board: ESP8266 (NodeMCU 1.0 / Wemos D1 Mini)
- * Upload Speed: 115200
- *
- * Autor: NeuroSense Team
- * Licencia: MIT
- * ============================================================================
+ *   2. Instala el board "ESP8266" (Boards Manager).
+ *   3. Instala la libreria ArduinoJson v7 (Administrar Bibliotecas).
+ *   4. Selecciona tu placa (NodeMCU 1.0 / Wemos D1 Mini).
+ *   5. Conecta por USB, haz clic en Subir.
+ *   6. Abre Monitor Serial a 115200 baud para ver las fases.
+ * ============================================================
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-// ============================================================================
-// CONFIGURACION PRE-CARGADA — No necesitas modificar nada
-// ============================================================================
+// =====================  CONFIGURACION  =====================
+const char* WIFI_SSID     = "${esc(wifiSsid)}";
+const char* WIFI_PASS     = "${esc(wifiPassword)}";
+const char* SERVER_HOST   = "${esc(serverHost)}";
+const char* DEVICE_CODE   = "${esc(deviceCode)}";
+const char* DEVICE_NAME   = "${esc(deviceName)}";
 
-const char* WIFI_SSID     = "${escapeC(wifiSsid)}";
-const char* WIFI_PASSWORD = "${escapeC(wifiPassword)}";
-const char* SERVER_URL    = "${escapeC(serverUrl)}";
-const char* DATA_ENDPOINT = "/api/v1/data";
-const char* AUTH_TOKEN    = "${escapeC(authToken)}";
-const char* DEVICE_NAME   = "${escapeC(deviceName)}";
-const char* DEVICE_CODE   = "${escapeC(deviceCode)}";
+// Intervalo entre envios (ms)
+#define SEND_INTERVAL  5000
+// Maximo de intentos WiFi (x 500 ms)
+#define WIFI_RETRIES   40
 
-// Intervalo de envio (milisegundos)
-#define SEND_INTERVAL_MS  2000
-
-// Timeout HTTP (milisegundos)
-#define HTTP_TIMEOUT_MS   10000
-
-// LED indicador (GPIO2 en ESP8266, activo bajo)
-#define STATUS_LED        LED_BUILTIN
-
-// ============================================================================
-// ESTADOS
-// ============================================================================
-
-enum DeviceState {
-  STATE_WIFI_CONNECTING,
-  STATE_WIFI_CONNECTED,
-  STATE_SENDING_DATA,
-  STATE_ERROR
+// ====================  VARIABLES GLOBALES  ==================
+enum Phase {
+  PHASE_INIT,
+  PHASE_WIFI_CONNECTING,
+  PHASE_WIFI_OK,
+  PHASE_SENDING,
+  PHASE_CONFIRMED,
+  PHASE_ERROR
 };
 
-DeviceState currentState = STATE_WIFI_CONNECTING;
+Phase phase = PHASE_INIT;
+unsigned long lastSend   = 0;
+unsigned long sendCount  = 0;
+unsigned long okCount    = 0;
+unsigned long failCount  = 0;
 
-// Timers
-unsigned long lastSendTime = 0;
-unsigned long lastWifiCheckTime = 0;
-unsigned long lastBlinkTime = 0;
-
-// Estadisticas
-unsigned long packetsSent = 0;
-unsigned long packetsOk = 0;
-unsigned long packetsFailed = 0;
-unsigned long totalAlerts = 0;
-float lastStressIndex = 0.0;
-
-// ============================================================================
-// SIMULACION DE SENSORES
-// ============================================================================
-
-float simulateGSR() {
-  float base = 0.35 + 0.15 * sin(millis() / 10000.0);
-  float noise = (random(-100, 100) / 1000.0);
-  if (random(0, 100) < 10) {
-    base += random(10, 30) / 100.0;
-  }
-  return constrain(base + noise, 0.0, 1.0);
+// ========================  HELPERS  =========================
+void printPhase(const char* msg) {
+  Serial.println();
+  Serial.println("--------------------------------------------");
+  Serial.print("  FASE -> ");
+  Serial.println(msg);
+  Serial.println("--------------------------------------------");
 }
 
-float simulateSound() {
-  float base = 60.0 + 30.0 * sin(millis() / 8000.0);
-  float noise = random(-20, 20);
-  if (random(0, 100) < 8) {
-    base += random(50, 150);
-  }
-  return constrain(base + noise, 0.0, 255.0);
-}
-
-void simulateAccel(float &ax, float &ay, float &az) {
-  ax = random(-50, 50) + 10.0 * sin(millis() / 5000.0);
-  ay = random(-50, 50) + 10.0 * cos(millis() / 7000.0);
-  az = 1024.0 + random(-30, 30);
-  if (random(0, 100) < 5) {
-    ax += random(200, 800);
-    ay += random(200, 800);
-    az += random(100, 500);
-  }
-}
-
-// ============================================================================
-// ENVIO DE DATOS
-// ============================================================================
-
-bool sendSensorData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HTTP] WiFi no conectado. Saltando envio.");
-    return false;
-  }
-
-  float gsr = simulateGSR();
-  float sound = simulateSound();
-  float accelX, accelY, accelZ;
-  simulateAccel(accelX, accelY, accelZ);
-
-  JsonDocument doc;
-  doc["auth_token"] = AUTH_TOKEN;
-  doc["gsr"] = round(gsr * 1000.0) / 1000.0;
-  doc["sound"] = round(sound * 10.0) / 10.0;
-  doc["accel_x"] = round(accelX * 10.0) / 10.0;
-  doc["accel_y"] = round(accelY * 10.0) / 10.0;
-  doc["accel_z"] = round(accelZ * 10.0) / 10.0;
-  doc["sent_at"] = (unsigned long)millis();
-
-  String payload;
-  serializeJson(doc, payload);
-
-  Serial.println("-------------------------------------");
-  Serial.print("[DATA] Paquete #"); Serial.println(packetsSent + 1);
-  Serial.print("[DATA] GSR="); Serial.print(gsr, 3);
-  Serial.print(" | Sound="); Serial.print(sound, 1);
-  Serial.print(" | Accel=("); Serial.print(accelX, 1);
-  Serial.print(", "); Serial.print(accelY, 1);
-  Serial.print(", "); Serial.print(accelZ, 1);
-  Serial.println(")");
-
-  WiFiClient client;
-  HTTPClient http;
-
-  String url = String(SERVER_URL) + String(DATA_ENDPOINT);
-  Serial.print("[HTTP] POST -> "); Serial.println(url);
-
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(HTTP_TIMEOUT_MS);
-
-  unsigned long sendStart = millis();
-  int httpCode = http.POST(payload);
-  unsigned long sendDuration = millis() - sendStart;
-
-  packetsSent++;
-
-  if (httpCode > 0) {
-    String response = http.getString();
-    Serial.print("[HTTP] Codigo: "); Serial.print(httpCode);
-    Serial.print(" | Tiempo: "); Serial.print(sendDuration); Serial.println("ms");
-
-    if (httpCode == 200) {
-      packetsOk++;
-
-      JsonDocument resDoc;
-      DeserializationError err = deserializeJson(resDoc, response);
-
-      if (!err) {
-        lastStressIndex = resDoc["stress_index"] | 0.0f;
-        int alerts = resDoc["alerts"] | 0;
-        int latency = resDoc["latency_ms"] | 0;
-        totalAlerts += alerts;
-
-        Serial.print("[RESP] Estres: "); Serial.print(lastStressIndex * 100, 1); Serial.println("%");
-        Serial.print("[RESP] Alertas: "); Serial.println(alerts);
-        Serial.print("[RESP] Latencia: "); Serial.print(latency); Serial.println("ms");
-      }
-
-      http.end();
-      return true;
-    } else if (httpCode == 401) {
-      Serial.println("[HTTP] ERROR 401: Token invalido.");
-    } else {
-      Serial.print("[HTTP] ERROR "); Serial.print(httpCode);
-      Serial.print(": "); Serial.println(response);
-    }
-  } else {
-    Serial.print("[HTTP] Error conexion: "); Serial.println(http.errorToString(httpCode));
-  }
-
-  packetsFailed++;
-  http.end();
-  return false;
-}
-
-// ============================================================================
-// LED
-// ============================================================================
-
-void updateStatusLED() {
-  unsigned long now = millis();
-  int interval;
-  switch (currentState) {
-    case STATE_WIFI_CONNECTING: interval = 250;  break;
-    case STATE_WIFI_CONNECTED:  interval = 500;  break;
-    case STATE_SENDING_DATA:    interval = 2000; break;
-    case STATE_ERROR:           interval = 150;  break;
-    default:                    interval = 500;  break;
-  }
-  if (now - lastBlinkTime >= (unsigned long)interval) {
-    lastBlinkTime = now;
-    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
-  }
-}
-
-// ============================================================================
-// ESTADISTICAS
-// ============================================================================
-
-void printStats() {
-  Serial.println("=====================================");
-  Serial.println("  ESTADISTICAS DE SESION");
-  Serial.println("=====================================");
-  Serial.print("  Dispositivo:     "); Serial.println(DEVICE_NAME);
-  Serial.print("  Codigo:          "); Serial.println(DEVICE_CODE);
-  Serial.print("  Enviados:        "); Serial.println(packetsSent);
-  Serial.print("  Exitosos:        "); Serial.println(packetsOk);
-  Serial.print("  Fallidos:        "); Serial.println(packetsFailed);
-  Serial.print("  Alertas:         "); Serial.println(totalAlerts);
-  Serial.print("  Ultimo estres:   "); Serial.print(lastStressIndex * 100, 1); Serial.println("%");
-  Serial.print("  WiFi RSSI:       "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
-  Serial.print("  IP:              "); Serial.println(WiFi.localIP());
-  Serial.print("  Uptime:          "); Serial.print(millis() / 1000); Serial.println("s");
-  if (packetsSent > 0) {
-    float rate = (packetsOk * 100.0) / packetsSent;
-    Serial.print("  Tasa exito:      "); Serial.print(rate, 1); Serial.println("%");
-  }
-  Serial.println("=====================================");
-}
-
-// ============================================================================
-// SETUP
-// ============================================================================
-
+// ========================  SETUP  ===========================
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(300);
 
   Serial.println();
-  Serial.println("=====================================");
-  Serial.println("  NEUROSENSE ESP8266 v2.0.0");
-  Serial.print("  Dispositivo: "); Serial.println(DEVICE_NAME);
-  Serial.print("  Codigo:      "); Serial.println(DEVICE_CODE);
-  Serial.println("=====================================");
-  Serial.println();
+  Serial.println("============================================");
+  Serial.println("   NEUROSENSE ESP8266  v3.0");
+  Serial.print("   Dispositivo: "); Serial.println(DEVICE_NAME);
+  Serial.print("   Codigo:      "); Serial.println(DEVICE_CODE);
+  Serial.print("   Servidor:    https://"); Serial.println(SERVER_HOST);
+  Serial.println("============================================");
 
-  pinMode(STATUS_LED, OUTPUT);
-  digitalWrite(STATUS_LED, HIGH);
+  // ---- FASE 1: INIT ----
+  phase = PHASE_INIT;
+  printPhase("INICIALIZACION");
+  Serial.println("  LED configurado.");
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // apagado (activo bajo)
 
-  randomSeed(analogRead(A0) + micros());
+  // ---- FASE 2: WIFI CONNECTING ----
+  phase = PHASE_WIFI_CONNECTING;
+  printPhase("CONECTANDO WiFi");
+  Serial.print("  SSID: "); Serial.println(WIFI_SSID);
 
-  // Conectar WiFi
-  Serial.print("[WIFI] Conectando a: "); Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 60) {
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < WIFI_RETRIES) {
     delay(500);
     Serial.print(".");
-    retries++;
+    tries++;
+    // parpadeo rapido
+    digitalWrite(LED_BUILTIN, tries % 2 == 0 ? LOW : HIGH);
   }
   Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    currentState = STATE_SENDING_DATA;
-    Serial.println("[WIFI] Conectado!");
-    Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP());
-    Serial.print("[WIFI] RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
-    Serial.println("[READY] Enviando datos al servidor...");
-  } else {
-    currentState = STATE_ERROR;
-    Serial.println("[WIFI] ERROR: No se pudo conectar.");
-    Serial.println("[WIFI] Verifica el nombre y contrasena de la red.");
-    Serial.println("[WIFI] Reiniciando en 10 segundos...");
+  if (WiFi.status() != WL_CONNECTED) {
+    phase = PHASE_ERROR;
+    printPhase("ERROR WiFi");
+    Serial.println("  No se pudo conectar a la red WiFi.");
+    Serial.println("  Verifica SSID y contrasena.");
+    Serial.println("  Reiniciando en 10 s ...");
     delay(10000);
     ESP.restart();
+    return;
   }
 
+  // ---- FASE 3: WIFI OK ----
+  phase = PHASE_WIFI_OK;
+  printPhase("WiFi CONECTADO");
+  Serial.print("  IP local : "); Serial.println(WiFi.localIP());
+  Serial.print("  RSSI     : "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+  Serial.print("  Gateway  : "); Serial.println(WiFi.gatewayIP());
   Serial.println();
+  Serial.println("  Listo para enviar datos al servidor.");
+  Serial.print("  Intervalo: "); Serial.print(SEND_INTERVAL / 1000); Serial.println(" s");
+
+  digitalWrite(LED_BUILTIN, LOW); // encendido fijo = wifi ok
 }
 
-// ============================================================================
-// LOOP
-// ============================================================================
-
+// ========================  LOOP  ============================
 void loop() {
   unsigned long now = millis();
-  updateStatusLED();
 
-  // Verificar WiFi cada 10s
-  if (now - lastWifiCheckTime >= 10000) {
-    lastWifiCheckTime = now;
-
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WIFI] Conexion perdida. Reconectando...");
-      currentState = STATE_ERROR;
-      WiFi.reconnect();
-
-      int retries = 0;
-      while (WiFi.status() != WL_CONNECTED && retries < 30) {
-        delay(500);
-        Serial.print(".");
-        retries++;
-      }
-      Serial.println();
-
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("[WIFI] Reconectado.");
-        currentState = STATE_SENDING_DATA;
-      } else {
-        Serial.println("[WIFI] Reconexion fallida. Reintentando...");
-      }
-    }
-  }
-
-  // Enviar datos cada SEND_INTERVAL_MS
-  if (currentState == STATE_SENDING_DATA && now - lastSendTime >= SEND_INTERVAL_MS) {
-    lastSendTime = now;
-    sendSensorData();
-
-    // Estadisticas cada 10 paquetes
-    if (packetsSent > 0 && packetsSent % 10 == 0) {
-      printStats();
-    }
-  }
-
-  // Comandos Serial
-  if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\\n');
-    input.trim();
-
-    if (input.equalsIgnoreCase("STATUS")) {
-      printStats();
-    } else if (input.equalsIgnoreCase("RESET")) {
-      Serial.println("[CMD] Reiniciando...");
-      delay(1000);
-      ESP.restart();
+  // Revisar WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    phase = PHASE_ERROR;
+    printPhase("WiFi PERDIDO - reconectando");
+    WiFi.reconnect();
+    int t = 0;
+    while (WiFi.status() != WL_CONNECTED && t < 20) { delay(500); Serial.print("."); t++; }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      phase = PHASE_WIFI_OK;
+      printPhase("WiFi RECONECTADO");
+      Serial.print("  IP: "); Serial.println(WiFi.localIP());
     } else {
-      Serial.println("[CMD] Comandos: STATUS, RESET");
+      Serial.println("  Reconexion fallida. Reintentando ...");
+      delay(5000);
+      return;
+    }
+  }
+
+  // Enviar datos cada SEND_INTERVAL
+  if (now - lastSend >= SEND_INTERVAL) {
+    lastSend = now;
+    sendCount++;
+
+    phase = PHASE_SENDING;
+    Serial.println();
+    Serial.print("[ENVIO #"); Serial.print(sendCount); Serial.println("]");
+
+    // Construir JSON con valores fijos de prueba
+    JsonDocument doc;
+    doc["device_code"] = DEVICE_CODE;
+    doc["gsr"]         = 0.35;
+    doc["sound"]       = 65.0;
+    doc["accel_x"]     = 10.0;
+    doc["accel_y"]     = -5.0;
+    doc["accel_z"]     = 1024.0;
+    doc["sent_at"]     = (unsigned long)millis();
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Serial.print("  JSON: "); Serial.println(payload);
+
+    // HTTPS request
+    WiFiClientSecure client;
+    client.setInsecure();  // skip cert verify (ok for dev/test)
+
+    HTTPClient http;
+    String url = "https://" + String(SERVER_HOST) + "/api/v1/data";
+    Serial.print("  POST -> "); Serial.println(url);
+
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(15000);
+
+    unsigned long t0 = millis();
+    int code = http.POST(payload);
+    unsigned long dur = millis() - t0;
+
+    if (code > 0) {
+      String body = http.getString();
+      Serial.print("  HTTP "); Serial.print(code);
+      Serial.print("  ("); Serial.print(dur); Serial.println(" ms)");
+      Serial.print("  Resp: "); Serial.println(body);
+
+      if (code == 200) {
+        okCount++;
+        phase = PHASE_CONFIRMED;
+        printPhase("DATOS CONFIRMADOS POR SERVIDOR");
+        Serial.print("  Paquetes OK: "); Serial.print(okCount);
+        Serial.print(" / "); Serial.println(sendCount);
+
+        // Parse response
+        JsonDocument res;
+        if (!deserializeJson(res, body)) {
+          float stress = res["stress_index"] | 0.0f;
+          int alerts   = res["alerts"] | 0;
+          Serial.print("  Estres: "); Serial.print(stress * 100, 1); Serial.println(" %");
+          Serial.print("  Alertas: "); Serial.println(alerts);
+        }
+      } else {
+        failCount++;
+        Serial.print("  ERROR del servidor: "); Serial.println(body);
+      }
+    } else {
+      failCount++;
+      Serial.print("  ERROR conexion: "); Serial.println(http.errorToString(code));
+    }
+
+    http.end();
+
+    // Resumen cada 5 envios
+    if (sendCount % 5 == 0) {
+      Serial.println();
+      Serial.println("========== RESUMEN ==========");
+      Serial.print("  Enviados : "); Serial.println(sendCount);
+      Serial.print("  OK       : "); Serial.println(okCount);
+      Serial.print("  Fallidos : "); Serial.println(failCount);
+      Serial.print("  WiFi RSSI: "); Serial.print(WiFi.RSSI()); Serial.println(" dBm");
+      Serial.print("  Uptime   : "); Serial.print(millis() / 1000); Serial.println(" s");
+      Serial.println("=============================");
     }
   }
 
