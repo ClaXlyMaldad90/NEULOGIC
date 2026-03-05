@@ -8,7 +8,6 @@ import { MetricCard } from "@/components/metric-card"
 import { SensorChart } from "@/components/sensor-chart"
 import { StressTimeline } from "@/components/stress-timeline"
 import { RecentAlerts } from "@/components/recent-alerts"
-import { EspSimulator } from "@/components/esp-simulator"
 import { Zap, Volume2, Activity, Cpu, Timer } from "lucide-react"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
@@ -40,7 +39,7 @@ export default function DashboardPage() {
             No hay dispositivos vinculados
           </h2>
           <p className="mb-6 text-muted-foreground">
-            Conecta tu primer ESP8266 por USB para comenzar a monitorear.
+            Agrega tu primer ESP8266 para descargar el firmware y comenzar a monitorear.
           </p>
           <Button asChild>
             <Link href="/dashboard/devices">Vincular dispositivo</Link>
@@ -178,8 +177,7 @@ export default function DashboardPage() {
         thresholdLabel="Movimiento alto"
       />
 
-      {/* ESP8266 Simulator - for testing */}
-      <EspSimulator deviceId={deviceId} />
+
     </div>
   )
 }

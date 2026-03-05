@@ -30,27 +30,22 @@ import {
   Loader2,
   Shield,
   Clock,
-  Usb,
   Wifi,
-  Key,
+  Download,
   CheckCircle2,
   AlertCircle,
-  Copy,
+  Signal,
   Eye,
   EyeOff,
-  Signal,
 } from "lucide-react"
 import { toast } from "sonner"
-
-type SetupStep = "connect" | "wifi" | "provisioning" | "complete"
+import { generateFirmwareINO } from "@/lib/generate-firmware"
 
 export default function DevicesPage() {
   const { deviceLinks, refetch, loading } = useDevices()
   const [open, setOpen] = useState(false)
 
-  // Setup wizard state
-  const [step, setStep] = useState<SetupStep>("connect")
-  const [serialConnected, setSerialConnected] = useState(false)
+  // Form state
   const [wifiSsid, setWifiSsid] = useState("")
   const [wifiPassword, setWifiPassword] = useState("")
   const [showWifiPassword, setShowWifiPassword] = useState(false)
@@ -58,17 +53,13 @@ export default function DevicesPage() {
   const [childName, setChildName] = useState("")
   const [consentAccepted, setConsentAccepted] = useState(false)
   const [submitting, setSubmitting] = useState(false)
-  const [provisionedDevice, setProvisionedDevice] = useState<{
+  const [provisioned, setProvisioned] = useState<{
     device_code: string
     auth_token: string
     device_name: string
   } | null>(null)
-  const [showAuthToken, setShowAuthToken] = useState(false)
-  const [serialPort, setSerialPort] = useState<SerialPort | null>(null)
 
-  function resetWizard() {
-    setStep("connect")
-    setSerialConnected(false)
+  function resetForm() {
     setWifiSsid("")
     setWifiPassword("")
     setShowWifiPassword(false)
@@ -76,59 +67,37 @@ export default function DevicesPage() {
     setChildName("")
     setConsentAccepted(false)
     setSubmitting(false)
-    setProvisionedDevice(null)
-    setShowAuthToken(false)
-    if (serialPort) {
-      try {
-        serialPort.close()
-      } catch {
-        // ignore
-      }
-    }
-    setSerialPort(null)
+    setProvisioned(null)
   }
 
   function handleOpenChange(isOpen: boolean) {
-    if (!isOpen) {
-      resetWizard()
-    }
+    if (!isOpen) resetForm()
     setOpen(isOpen)
   }
 
-  async function handleConnectSerial() {
-    try {
-      if (!("serial" in navigator)) {
-        toast.error("Tu navegador no soporta Web Serial API", {
-          description:
-            "Usa Google Chrome o Microsoft Edge para conectar el ESP8266 por USB.",
-        })
-        return
-      }
+  function downloadFirmware(device: {
+    device_code: string
+    auth_token: string
+    device_name: string
+  }) {
+    const ino = generateFirmwareINO({
+      wifiSsid,
+      wifiPassword,
+      serverUrl: window.location.origin,
+      authToken: device.auth_token,
+      deviceName: device.device_name,
+      deviceCode: device.device_code,
+    })
 
-      const port = await (navigator as Navigator & { serial: Serial }).serial.requestPort({
-        filters: [
-          { usbVendorId: 0x1a86 }, // CH340
-          { usbVendorId: 0x10c4 }, // CP210x
-          { usbVendorId: 0x0403 }, // FTDI
-        ],
-      })
-
-      await port.open({ baudRate: 115200 })
-      setSerialPort(port)
-      setSerialConnected(true)
-      toast.success("ESP8266 detectado correctamente")
-      setStep("wifi")
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "NotFoundError") {
-        toast.error("No se selecciono ningun dispositivo", {
-          description: "Asegurate de que el ESP8266 esta conectado por USB.",
-        })
-      } else {
-        toast.error("Error al conectar con el ESP8266", {
-          description: "Verifica la conexion USB e intentalo de nuevo.",
-        })
-      }
-    }
+    const blob = new Blob([ino], { type: "text/plain" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `neurosense_${device.device_code}.ino`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   }
 
   async function handleProvision() {
@@ -136,12 +105,14 @@ export default function DevicesPage() {
       toast.error("Debes aceptar el consentimiento para continuar")
       return
     }
+    if (!wifiSsid.trim()) {
+      toast.error("Ingresa el nombre de la red WiFi")
+      return
+    }
 
     setSubmitting(true)
-    setStep("provisioning")
 
     try {
-      // Step 1: Provision the device on the server
       const res = await fetch("/api/devices/provision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -157,52 +128,27 @@ export default function DevicesPage() {
 
       if (!res.ok) {
         toast.error(json.error || "Error al provisionar dispositivo")
-        setStep("wifi")
         setSubmitting(false)
         return
       }
 
-      // Step 2: Send config to ESP8266 via Serial
-      if (serialPort && serialPort.writable) {
-        try {
-          const writer = serialPort.writable.getWriter()
-          const config = JSON.stringify({
-            cmd: "config",
-            ssid: wifiSsid,
-            pass: wifiPassword,
-            token: json.device.auth_token,
-            server: window.location.origin,
-            endpoint: "/api/v1/data",
-          })
-          const encoder = new TextEncoder()
-          await writer.write(encoder.encode(config + "\n"))
-          writer.releaseLock()
-          toast.success("Configuracion enviada al ESP8266")
-        } catch {
-          toast.info(
-            "No se pudo enviar la configuracion al ESP8266 por serial. Usa el token manualmente."
-          )
-        }
-      }
-
-      setProvisionedDevice({
+      const device = {
         device_code: json.device.device_code,
         auth_token: json.device.auth_token,
         device_name: json.device.device_name,
-      })
-      setStep("complete")
+      }
+
+      setProvisioned(device)
+
+      // Auto-download the .ino file
+      downloadFirmware(device)
+      toast.success("Dispositivo creado. El archivo .ino se esta descargando.")
       await refetch()
     } catch {
       toast.error("Error de conexion al servidor")
-      setStep("wifi")
     } finally {
       setSubmitting(false)
     }
-  }
-
-  function copyToClipboard(text: string, label: string) {
-    navigator.clipboard.writeText(text)
-    toast.success(`${label} copiado al portapapeles`)
   }
 
   function formatDate(dateStr: string) {
@@ -232,110 +178,30 @@ export default function DevicesPage() {
           <DialogContent className="sm:max-w-lg">
             <DialogHeader>
               <DialogTitle className="text-foreground">
-                Configurar ESP8266
+                {provisioned ? "Dispositivo creado" : "Configurar ESP8266"}
               </DialogTitle>
               <DialogDescription>
-                Conecta tu ESP8266 por USB para configurar la red WiFi y vincularlo a tu cuenta
+                {provisioned
+                  ? "Tu dispositivo esta listo. Sube el archivo .ino desde Arduino IDE."
+                  : "Completa los datos para generar el firmware pre-configurado"}
               </DialogDescription>
             </DialogHeader>
 
-            {/* Progress Steps */}
-            <div className="flex items-center gap-2 py-2">
-              {(["connect", "wifi", "provisioning", "complete"] as SetupStep[]).map(
-                (s, i) => (
-                  <div key={s} className="flex items-center gap-2">
-                    <div
-                      className={`flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold transition-colors ${
-                        step === s
-                          ? "bg-primary text-primary-foreground"
-                          : (["connect", "wifi", "provisioning", "complete"].indexOf(step) >
-                              i)
-                            ? "bg-primary/20 text-primary"
-                            : "bg-muted text-muted-foreground"
-                      }`}
-                    >
-                      {["connect", "wifi", "provisioning", "complete"].indexOf(step) > i ? (
-                        <CheckCircle2 className="h-4 w-4" />
-                      ) : (
-                        i + 1
-                      )}
-                    </div>
-                    {i < 3 && (
-                      <div
-                        className={`h-px w-6 ${
-                          ["connect", "wifi", "provisioning", "complete"].indexOf(step) > i
-                            ? "bg-primary"
-                            : "bg-border"
-                        }`}
-                      />
-                    )}
-                  </div>
-                )
-              )}
-            </div>
-
-            {/* Step 1: Connect USB */}
-            {step === "connect" && (
+            {/* Form view */}
+            {!provisioned && (
               <div className="flex flex-col gap-4 py-2">
-                <div className="rounded-lg border border-border bg-muted/30 p-5">
-                  <div className="mb-4 flex items-center gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-                      <Usb className="h-5 w-5 text-primary" />
-                    </div>
-                    <div>
-                      <h3 className="text-sm font-semibold text-foreground">
-                        Conectar ESP8266 por USB
-                      </h3>
-                      <p className="text-xs text-muted-foreground">
-                        Se requiere Google Chrome o Microsoft Edge
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex flex-col gap-2 text-xs text-muted-foreground">
-                    <p>1. Conecta tu ESP8266 al computador usando un cable USB</p>
-                    <p>2. Asegurate de que el driver CH340/CP210x esta instalado</p>
-                    <p>
-                      3. Haz clic en el boton de abajo y selecciona el puerto serial del ESP8266
-                    </p>
-                  </div>
-                  <div className="mt-2 rounded-md border border-chart-3/30 bg-chart-3/5 p-2.5 text-xs text-chart-3">
-                    <AlertCircle className="mb-1 inline h-3.5 w-3.5" /> El navegador pedira
-                    permiso para acceder al puerto serial. Es seguro aceptar.
-                  </div>
-                </div>
-                <Button
-                  onClick={handleConnectSerial}
-                  className="w-full"
-                  size="lg"
-                >
-                  <Usb className="mr-2 h-4 w-4" />
-                  Detectar ESP8266
-                </Button>
-              </div>
-            )}
-
-            {/* Step 2: WiFi Config + Consent */}
-            {step === "wifi" && (
-              <div className="flex flex-col gap-4 py-2">
-                <div className="flex items-center gap-2 rounded-lg border border-chart-2/30 bg-chart-2/5 p-3 text-xs text-chart-2">
-                  <CheckCircle2 className="h-4 w-4 shrink-0" />
-                  <span>
-                    ESP8266 conectado correctamente por USB
-                  </span>
-                </div>
-
                 {/* WiFi Config */}
                 <div className="rounded-lg border border-border bg-muted/30 p-4">
                   <div className="mb-3 flex items-center gap-2">
                     <Wifi className="h-4 w-4 text-primary" />
                     <span className="text-sm font-semibold text-foreground">
-                      Configuracion de Red WiFi
+                      Red WiFi del ESP8266
                     </span>
                   </div>
                   <div className="flex flex-col gap-3">
                     <div className="flex flex-col gap-1.5">
                       <Label htmlFor="wifiSsid" className="text-xs text-foreground">
-                        Nombre de la red
+                        Nombre de la red (SSID)
                       </Label>
                       <Input
                         id="wifiSsid"
@@ -372,6 +238,10 @@ export default function DevicesPage() {
                       </div>
                     </div>
                   </div>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    La contrasena se incluye unicamente en el archivo .ino que descargas.
+                    No se envia ni se almacena en el servidor.
+                  </p>
                 </div>
 
                 {/* Device Info */}
@@ -441,34 +311,33 @@ export default function DevicesPage() {
                 <DialogFooter>
                   <Button
                     onClick={handleProvision}
-                    disabled={!wifiSsid || !consentAccepted || submitting}
+                    disabled={!wifiSsid.trim() || !consentAccepted || submitting}
                     className="w-full"
                     size="lg"
                   >
-                    <Key className="mr-2 h-4 w-4" />
-                    Configurar y vincular
+                    {submitting ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Creando dispositivo...
+                      </>
+                    ) : (
+                      <>
+                        <Download className="mr-2 h-4 w-4" />
+                        Crear y descargar firmware
+                      </>
+                    )}
                   </Button>
                 </DialogFooter>
               </div>
             )}
 
-            {/* Step 3: Provisioning in progress */}
-            {step === "provisioning" && (
-              <div className="flex flex-col items-center justify-center gap-4 py-8">
-                <Loader2 className="h-10 w-10 animate-spin text-primary" />
-                <p className="text-sm text-muted-foreground">
-                  Configurando dispositivo y generando token de autenticacion...
-                </p>
-              </div>
-            )}
-
-            {/* Step 4: Complete */}
-            {step === "complete" && provisionedDevice && (
+            {/* Success view */}
+            {provisioned && (
               <div className="flex flex-col gap-4 py-2">
                 <div className="flex items-center gap-2 rounded-lg border border-chart-2/30 bg-chart-2/5 p-3 text-sm text-chart-2">
                   <CheckCircle2 className="h-5 w-5 shrink-0" />
                   <span className="font-medium">
-                    Dispositivo configurado y vinculado correctamente
+                    Dispositivo creado y firmware descargado
                   </span>
                 </div>
 
@@ -476,88 +345,81 @@ export default function DevicesPage() {
                   <h4 className="mb-3 text-sm font-semibold text-foreground">
                     Datos del dispositivo
                   </h4>
-                  <div className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-2">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-muted-foreground">
-                        Codigo del dispositivo
-                      </span>
-                      <div className="flex items-center gap-2">
-                        <code className="rounded bg-secondary px-2 py-0.5 text-xs font-mono text-foreground">
-                          {provisionedDevice.device_code}
-                        </code>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-6 w-6"
-                          onClick={() =>
-                            copyToClipboard(
-                              provisionedDevice.device_code,
-                              "Codigo"
-                            )
-                          }
-                        >
-                          <Copy className="h-3 w-3" />
-                        </Button>
-                      </div>
+                      <span className="text-xs text-muted-foreground">Codigo</span>
+                      <code className="rounded bg-secondary px-2 py-0.5 text-xs font-mono text-foreground">
+                        {provisioned.device_code}
+                      </code>
                     </div>
-
-                    <Separator />
-
-                    {/* Auth Token - Critical */}
-                    <div>
-                      <div className="mb-2 flex items-center gap-2">
-                        <Key className="h-3.5 w-3.5 text-chart-4" />
-                        <span className="text-xs font-semibold text-foreground">
-                          Token de autenticacion unico
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <code className="flex-1 overflow-hidden rounded bg-secondary px-2 py-1 text-xs font-mono text-foreground">
-                          {showAuthToken
-                            ? provisionedDevice.auth_token
-                            : "********************************"}
-                        </code>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 shrink-0"
-                          onClick={() => setShowAuthToken(!showAuthToken)}
-                        >
-                          {showAuthToken ? (
-                            <EyeOff className="h-3.5 w-3.5" />
-                          ) : (
-                            <Eye className="h-3.5 w-3.5" />
-                          )}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7 shrink-0"
-                          onClick={() =>
-                            copyToClipboard(
-                              provisionedDevice.auth_token,
-                              "Token"
-                            )
-                          }
-                        >
-                          <Copy className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                      <p className="mt-2 text-xs text-chart-4">
-                        Este token vincula exclusivamente este ESP8266 con tu cuenta.
-                        Los datos enviados con este token solo seran visibles por ti.
-                      </p>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-muted-foreground">Nombre</span>
+                      <span className="text-xs text-foreground">
+                        {provisioned.device_name}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-muted-foreground">Red WiFi</span>
+                      <span className="text-xs text-foreground">{wifiSsid}</span>
                     </div>
                   </div>
                 </div>
 
-                <Button
-                  onClick={() => handleOpenChange(false)}
-                  className="w-full"
-                  size="lg"
-                >
-                  Finalizar
-                </Button>
+                <div className="rounded-lg border border-chart-3/30 bg-chart-3/5 p-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <AlertCircle className="h-4 w-4 text-chart-3" />
+                    <span className="text-sm font-semibold text-chart-3">
+                      Pasos siguientes
+                    </span>
+                  </div>
+                  <ol className="flex flex-col gap-1.5 text-xs text-muted-foreground">
+                    <li>
+                      {"1. Abre el archivo"}{" "}
+                      <code className="rounded bg-secondary px-1 text-foreground">
+                        neurosense_{provisioned.device_code}.ino
+                      </code>{" "}
+                      {"en Arduino IDE."}
+                    </li>
+                    <li>
+                      {"2. Instala el board ESP8266 desde"}{" "}
+                      <span className="text-foreground">
+                        Herramientas {">"} Board {">"} Boards Manager.
+                      </span>
+                    </li>
+                    <li>
+                      {"3. Instala la libreria"}{" "}
+                      <span className="text-foreground">ArduinoJson</span>{" "}
+                      {"desde Herramientas > Administrar Bibliotecas."}
+                    </li>
+                    <li>
+                      {"4. Selecciona tu placa (NodeMCU 1.0 o Wemos D1 Mini)."}
+                    </li>
+                    <li>
+                      {"5. Conecta el ESP8266 por USB y haz clic en"}{" "}
+                      <span className="text-foreground">Subir</span>.
+                    </li>
+                    <li>
+                      {"6. Abre el Monitor Serial (115200 baud) para verificar."}
+                    </li>
+                  </ol>
+                </div>
+
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    className="flex-1"
+                    onClick={() => downloadFirmware(provisioned)}
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    Descargar de nuevo
+                  </Button>
+                  <Button
+                    className="flex-1"
+                    onClick={() => handleOpenChange(false)}
+                  >
+                    Finalizar
+                  </Button>
+                </div>
               </div>
             )}
           </DialogContent>
@@ -576,8 +438,8 @@ export default function DevicesPage() {
             <h3 className="mb-2 text-lg font-semibold text-foreground">
               Sin dispositivos
             </h3>
-            <p className="mb-4 text-sm text-muted-foreground">
-              Conecta tu primer ESP8266 por USB para empezar
+            <p className="mb-4 text-center text-sm text-muted-foreground">
+              Agrega tu primer ESP8266 para generar y descargar el firmware pre-configurado
             </p>
           </CardContent>
         </Card>
@@ -624,7 +486,9 @@ export default function DevicesPage() {
                     <div className="flex items-center gap-1.5">
                       <span
                         className={`h-2 w-2 rounded-full ${
-                          link.devices.is_online ? "bg-success" : "bg-muted-foreground/40"
+                          link.devices.is_online
+                            ? "bg-chart-2"
+                            : "bg-muted-foreground/40"
                         }`}
                       />
                       <span className="text-xs text-foreground">
@@ -646,8 +510,8 @@ export default function DevicesPage() {
                   <div className="flex items-center justify-between">
                     <span className="text-muted-foreground">Consentimiento</span>
                     <div className="flex items-center gap-1">
-                      <Shield className="h-3 w-3 text-success" />
-                      <span className="text-xs text-success">Aceptado</span>
+                      <Shield className="h-3 w-3 text-chart-2" />
+                      <span className="text-xs text-chart-2">Aceptado</span>
                     </div>
                   </div>
                   <div className="flex items-center justify-between">
